@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { io } from 'socket.io-client';
+import { Peer } from 'peerjs';
 import confetti from 'canvas-confetti';
+import QRCode from 'qrcode';
 import {
   Users, Volume2, VolumeX, Shield, Play, Settings, RefreshCw,
   QrCode, Share2, Flame, LogOut, ChevronUp, ChevronDown
 } from 'lucide-react';
+import { TexasHoldemRoom } from './pokerEngine';
+import { getRandomMat } from './matEngine';
 
 const AVATARS = [
   '🐶', '🐱', '🦊', '🐻', '🐼', '🐨', '🦁', '🐯',
@@ -12,8 +15,8 @@ const AVATARS = [
 ];
 
 export default function App() {
-  const [socket, setSocket] = useState(null);
-  const [serverInfo, setServerInfo] = useState(null);
+  const [peer, setPeer] = useState(null);
+  const [myPeerId, setMyPeerId] = useState('');
   const [playerName, setPlayerName] = useState(() => localStorage.getItem('poker_name') || '');
   const [avatarIndex, setAvatarIndex] = useState(() => parseInt(localStorage.getItem('poker_avatar') || '0', 10));
   const [roomCodeInput, setRoomCodeInput] = useState('');
@@ -27,37 +30,48 @@ export default function App() {
   });
 
   const [gameState, setGameState] = useState(null);
-  const [myPlayerId, setMyPlayerId] = useState(null);
+  const [isHost, setIsHost] = useState(false);
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState('');
   const [raiseVal, setRaiseVal] = useState(40);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showQrModal, setShowQrModal] = useState(false);
   const [showMatQuickMenu, setShowMatQuickMenu] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
-  // Connect to server
+  // References for Host P2P
+  const roomRef = useRef(null); // TexasHoldemRoom instance
+  const connsRef = useRef(new Map()); // peerId -> DataConnection
+  const myConnToHostRef = useRef(null); // DataConnection to host (if client)
+
+  // Initialize PeerJS
   useEffect(() => {
-    fetch('/api/server-info')
-      .then(res => res.json())
-      .then(info => setServerInfo(info))
-      .catch(err => console.log('Server info fetch error', err));
+    const p = new Peer();
+    setPeer(p);
 
-    const s = io();
-    setSocket(s);
-
-    s.on('connect', () => {
-      setMyPlayerId(s.id);
+    p.on('open', (id) => {
+      setMyPeerId(id);
     });
 
-    s.on('room_state', (state) => {
-      setGameState(state);
-      // Trigger confetti on win
-      const me = state.players.find(p => p.id === s.id);
-      if (state.state === 'SHOWDOWN' && me && me.lastActionText && me.lastActionText.includes('win')) {
-        confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
-      }
+    p.on('connection', (conn) => {
+      // Incoming connection (HOST handles this)
+      conn.on('open', () => {
+        connsRef.current.set(conn.peer, conn);
+      });
+
+      conn.on('data', (data) => {
+        handleHostIncomingMessage(conn.peer, data);
+      });
+
+      conn.on('close', () => {
+        connsRef.current.delete(conn.peer);
+        if (roomRef.current) {
+          roomRef.current.removePlayer(conn.peer);
+          broadcastHostState();
+        }
+      });
     });
 
-    return () => s.disconnect();
+    return () => p.destroy();
   }, []);
 
   // Save profile
@@ -66,54 +80,187 @@ export default function App() {
     localStorage.setItem('poker_avatar', avatarIndex.toString());
   }, [playerName, avatarIndex]);
 
-  // Current player
-  const me = gameState?.players?.find(p => p.id === myPlayerId);
-  const isHost = gameState?.hostId === myPlayerId;
-  const isMyTurn = gameState && gameState.activePlayerIndex !== -1 &&
-    gameState.players[gameState.activePlayerIndex]?.id === myPlayerId;
-
-  // Actions
-  const handleCreateRoom = () => {
-    if (!playerName.trim()) return alert('Введи имя!');
-    socket.emit('create_room', {
-      playerName,
-      avatar: avatarIndex,
-      config
-    }, (res) => {
-      if (res.success) {
-        setGameState(res.state);
-      }
-    });
+  // Generate QR code for room link
+  const generateQrForRoom = (code) => {
+    const url = `${window.location.origin}${window.location.pathname}?room=${code}`;
+    QRCode.toDataURL(url).then(url => setQrCodeDataUrl(url)).catch(() => {});
   };
 
+  // Check URL query for room code auto-fill
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const r = params.get('room');
+    if (r) {
+      setRoomCodeInput(r.toUpperCase());
+    }
+  }, []);
+
+  // HOST Broadcast State
+  const broadcastHostState = () => {
+    if (!roomRef.current) return;
+    const room = roomRef.current;
+
+    // Update host's local game state
+    setGameState(room.getPublicState(peer.id));
+
+    // Send personalized state to each connected player
+    for (const [peerId, conn] of connsRef.current.entries()) {
+      if (conn.open) {
+        conn.send({
+          type: 'ROOM_STATE',
+          state: room.getPublicState(peerId)
+        });
+      }
+    }
+  };
+
+  // HOST Handler for player messages
+  const handleHostIncomingMessage = (fromPeerId, msg) => {
+    const room = roomRef.current;
+    if (!room) return;
+
+    if (msg.type === 'JOIN_REQUEST') {
+      const added = room.addPlayer({
+        id: fromPeerId,
+        name: msg.playerName || 'Игрок',
+        avatar: msg.avatar || 0
+      });
+
+      const conn = connsRef.current.get(fromPeerId);
+      if (conn && conn.open) {
+        if (added) {
+          conn.send({ type: 'JOIN_SUCCESS', state: room.getPublicState(fromPeerId) });
+          broadcastHostState();
+        } else {
+          conn.send({ type: 'JOIN_ERROR', error: 'Стол полон или ошибка входа' });
+        }
+      }
+    } else if (msg.type === 'ACTION') {
+      room.handleAction(fromPeerId, msg.action, msg.amount);
+      broadcastHostState();
+    } else if (msg.type === 'MAT_REACTION') {
+      const p = room.players.find(pl => pl.id === fromPeerId);
+      if (p) {
+        p.reaction = msg.matText;
+        room.addLog(`${p.name}: "${msg.matText}"`);
+        broadcastHostState();
+      }
+    }
+  };
+
+  // Host creates room with 4-letter code as peer ID suffix or uses code
+  const handleCreateRoom = () => {
+    if (!playerName.trim()) return alert('Введи имя!');
+    if (!peer) return alert('Инициализация сети...');
+
+    const code = Math.random().toString(36).substring(2, 6).toUpperCase();
+    
+    // Create new room with host
+    const hostPlayer = {
+      id: peer.id,
+      name: playerName,
+      avatar: avatarIndex
+    };
+
+    const room = new TexasHoldemRoom(code, hostPlayer, config);
+    roomRef.current = room;
+    setIsHost(true);
+    setGameState(room.getPublicState(peer.id));
+    generateQrForRoom(peer.id);
+  };
+
+  // Client joins room by host's peer ID or code
   const handleJoinRoom = () => {
     if (!playerName.trim()) return alert('Введи имя!');
     if (!roomCodeInput.trim()) return alert('Введи код комнаты!');
-    socket.emit('join_room', {
-      roomCode: roomCodeInput,
-      playerName,
-      avatar: avatarIndex
-    }, (res) => {
-      if (res.success) {
-        setGameState(res.state);
-      } else {
-        alert(res.error || 'Ошибка входа');
+    if (!peer) return alert('Инициализация сети...');
+
+    const targetHostId = roomCodeInput.trim();
+    const conn = peer.connect(targetHostId);
+    myConnToHostRef.current = conn;
+
+    conn.on('open', () => {
+      conn.send({
+        type: 'JOIN_REQUEST',
+        playerName,
+        avatar: avatarIndex
+      });
+    });
+
+    conn.on('data', (data) => {
+      if (data.type === 'JOIN_SUCCESS' || data.type === 'ROOM_STATE') {
+        setGameState(data.state);
+        setIsHost(false);
+
+        // Win confetti
+        const me = data.state.players.find(p => p.id === peer.id);
+        if (data.state.state === 'SHOWDOWN' && me && me.lastActionText && me.lastActionText.includes('win')) {
+          confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
+        }
+      } else if (data.type === 'JOIN_ERROR') {
+        alert(data.error);
       }
+    });
+
+    conn.on('error', (err) => {
+      alert('Ошибка подключения к комнате: ' + err.message);
     });
   };
 
+  // Perform Poker Action
   const handleAction = (action, amount = 0) => {
-    socket.emit('action', { action, amount });
+    if (isHost) {
+      if (roomRef.current) {
+        roomRef.current.handleAction(peer.id, action, amount);
+        broadcastHostState();
+      }
+    } else {
+      if (myConnToHostRef.current && myConnToHostRef.current.open) {
+        myConnToHostRef.current.send({
+          type: 'ACTION',
+          action,
+          amount
+        });
+      }
+    }
   };
 
+  // Host starts game
   const handleStartGame = () => {
-    socket.emit('start_game');
+    if (isHost && roomRef.current) {
+      roomRef.current.startHand();
+      broadcastHostState();
+    }
   };
 
+  // Send Custom Mat
   const handleSendCustomMat = (text) => {
-    socket.emit('send_reaction', { matText: text });
+    if (isHost) {
+      if (roomRef.current) {
+        const p = roomRef.current.players.find(pl => pl.id === peer.id);
+        if (p) {
+          p.reaction = text;
+          roomRef.current.addLog(`${p.name}: "${text}"`);
+          broadcastHostState();
+        }
+      }
+    } else {
+      if (myConnToHostRef.current && myConnToHostRef.current.open) {
+        myConnToHostRef.current.send({
+          type: 'MAT_REACTION',
+          matText: text
+        });
+      }
+    }
     setShowMatQuickMenu(false);
   };
+
+  // Current player info
+  const myId = peer?.id;
+  const me = gameState?.players?.find(p => p.id === myId);
+  const isMyTurn = gameState && gameState.activePlayerIndex !== -1 &&
+    gameState.players[gameState.activePlayerIndex]?.id === myId;
+  const otherPlayers = gameState?.players?.filter(p => p.id !== myId) || [];
 
   // 1. Lobby / Start screen
   if (!gameState) {
@@ -168,20 +315,20 @@ export default function App() {
               MOON POKER
             </h1>
             <p style={{ margin: '6px 0 0', color: '#8e9bb5', fontSize: '14px' }}>
-              Локальный мультиплеер для телефонов
+              Играй с друзьями на телефоне без установки!
             </p>
           </div>
 
           {/* Profile Setup */}
           <div style={{ marginBottom: '20px' }}>
             <label style={{ display: 'block', fontSize: '13px', color: '#8e9bb5', marginBottom: '8px', fontWeight: '600' }}>
-              Твой погоняло / Имя:
+              Твой ник / имя:
             </label>
             <input
               type="text"
               value={playerName}
               onChange={(e) => setPlayerName(e.target.value)}
-              placeholder="Например: Саня Фулл-Хаус"
+              placeholder="Например: Саня Олл-Ин"
               style={{
                 width: '100%',
                 background: '#121524',
@@ -225,7 +372,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Join with Code */}
+          {/* Join with Code / Link */}
           <div style={{
             background: '#121524',
             padding: '16px',
@@ -239,10 +386,9 @@ export default function App() {
             <div style={{ display: 'flex', gap: '8px' }}>
               <input
                 type="text"
-                maxLength={4}
                 value={roomCodeInput}
-                onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
-                placeholder="4 БУКВЫ"
+                onChange={(e) => setRoomCodeInput(e.target.value)}
+                placeholder="Вставь ID / Код"
                 style={{
                   flex: 1,
                   background: '#0a0c16',
@@ -250,10 +396,9 @@ export default function App() {
                   borderRadius: '10px',
                   padding: '10px',
                   color: '#fff',
-                  fontSize: '16px',
-                  fontWeight: '700',
+                  fontSize: '14px',
+                  fontWeight: '600',
                   textAlign: 'center',
-                  letterSpacing: '2px',
                   outline: 'none'
                 }}
               />
@@ -320,70 +465,7 @@ export default function App() {
               <Settings size={15} /> Настройки фишек и блайндов
             </button>
           </div>
-
-          {/* Server Info & QR */}
-          {serverInfo && (
-            <div style={{ marginTop: '20px', textAlign: 'center', fontSize: '12px', color: '#64748b' }}>
-              Подключение по Wi-Fi: <span style={{ color: '#93c5fd', fontWeight: '600' }}>{serverInfo.url}</span>
-              <button
-                type="button"
-                onClick={() => setShowQrModal(true)}
-                style={{
-                  display: 'block',
-                  margin: '8px auto 0',
-                  background: 'none',
-                  border: 'none',
-                  color: '#818cf8',
-                  fontSize: '12px',
-                  cursor: 'pointer',
-                  textDecoration: 'underline'
-                }}
-              >
-                Показать QR-код для друзей
-              </button>
-            </div>
-          )}
         </div>
-
-        {/* Modal QR */}
-        {showQrModal && serverInfo?.qr && (
-          <div style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.85)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 100,
-            padding: '20px'
-          }} onClick={() => setShowQrModal(false)}>
-            <div style={{
-              background: '#1a1e33',
-              padding: '24px',
-              borderRadius: '24px',
-              textAlign: 'center',
-              border: '1px solid rgba(255,255,255,0.1)'
-            }} onClick={e => e.stopPropagation()}>
-              <h3 style={{ margin: '0 0 12px', fontSize: '18px' }}>Сканируй с телефона!</h3>
-              <img src={serverInfo.qr} alt="QR" style={{ width: '220px', height: '220px', borderRadius: '12px', background: '#fff', padding: '8px' }} />
-              <p style={{ margin: '12px 0 16px', fontSize: '13px', color: '#94a3b8' }}>{serverInfo.url}</p>
-              <button
-                type="button"
-                onClick={() => setShowQrModal(false)}
-                style={{
-                  background: '#334155',
-                  border: 'none',
-                  color: '#fff',
-                  padding: '8px 24px',
-                  borderRadius: '10px',
-                  cursor: 'pointer'
-                }}
-              >
-                Закрыть
-              </button>
-            </div>
-          </div>
-        )}
 
         {/* Modal Settings */}
         {showSettingsModal && (
@@ -515,9 +597,7 @@ export default function App() {
     );
   }
 
-  // 2. Game Table Screen (Refined from Reference "Moon Poker")
-  const otherPlayers = gameState.players.filter(p => p.id !== myPlayerId);
-
+  // 2. Table Screen (Moon Poker Style)
   return (
     <div style={{
       position: 'fixed',
@@ -552,17 +632,33 @@ export default function App() {
           <span style={{ fontWeight: '800', fontSize: '15px', letterSpacing: '-0.3px' }}>
             Moon Poker
           </span>
-          <div style={{
-            background: 'rgba(255,255,255,0.1)',
-            padding: '2px 8px',
-            borderRadius: '6px',
-            fontSize: '11px',
-            fontWeight: '700',
-            color: '#a5b4fc',
-            marginLeft: '4px'
-          }}>
-            КОД: {gameState.roomCode}
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              if (isHost) {
+                setShowQrModal(true);
+              } else {
+                navigator.clipboard?.writeText(window.location.href);
+                alert('Ссылка скопирована!');
+              }
+            }}
+            style={{
+              background: 'rgba(255,255,255,0.1)',
+              border: 'none',
+              padding: '3px 8px',
+              borderRadius: '6px',
+              fontSize: '11px',
+              fontWeight: '700',
+              color: '#a5b4fc',
+              marginLeft: '4px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px'
+            }}
+          >
+            <QrCode size={13} /> {isHost ? 'QR / ПРИГЛАСИТЬ' : 'КОД: ' + gameState.roomCode}
+          </button>
         </div>
 
         {/* Right tools */}
@@ -596,7 +692,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Quick Mat Panel Popover */}
+      {/* Quick Mat Popover */}
       {showMatQuickMenu && (
         <div style={{
           position: 'absolute',
@@ -642,6 +738,58 @@ export default function App() {
               {m}
             </button>
           ))}
+        </div>
+      )}
+
+      {/* Modal QR for Friend Invite */}
+      {showQrModal && qrCodeDataUrl && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0,0,0,0.85)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 100,
+          padding: '20px'
+        }} onClick={() => setShowQrModal(false)}>
+          <div style={{
+            background: '#1a1e33',
+            padding: '24px',
+            borderRadius: '24px',
+            textAlign: 'center',
+            border: '1px solid rgba(255,255,255,0.1)',
+            maxWidth: '320px'
+          }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 8px', fontSize: '18px' }}>Пригласи друзей!</h3>
+            <p style={{ fontSize: '12px', color: '#94a3b8', margin: '0 0 14px' }}>
+              Отсканируй камерой смартфона:
+            </p>
+            <img src={qrCodeDataUrl} alt="QR" style={{ width: '200px', height: '200px', borderRadius: '12px', background: '#fff', padding: '8px' }} />
+            <div style={{ marginTop: '12px', fontSize: '12px', color: '#cbd5e1', wordBreak: 'break-all' }}>
+              ID: <b>{peer?.id}</b>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                navigator.clipboard?.writeText(`${window.location.origin}${window.location.pathname}?room=${peer.id}`);
+                alert('Ссылка скопирована!');
+              }}
+              style={{
+                width: '100%',
+                marginTop: '14px',
+                background: '#4f46e5',
+                border: 'none',
+                color: '#fff',
+                padding: '10px',
+                borderRadius: '10px',
+                fontWeight: '700',
+                cursor: 'pointer'
+              }}
+            >
+              Скопировать ссылку на вход
+            </button>
+          </div>
         </div>
       )}
 
@@ -726,7 +874,7 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Status Badge (Folded / Called / Raise) */}
+                {/* Status Badge */}
                 {player.lastActionText && (
                   <div style={{
                     fontSize: '11px',
@@ -830,7 +978,7 @@ export default function App() {
           })}
         </div>
 
-        {/* CENTER: Pot & Community Board Cards */}
+        {/* CENTER: Pot & Community Cards */}
         <div style={{
           display: 'flex',
           flexDirection: 'column',
@@ -839,7 +987,6 @@ export default function App() {
           zIndex: 10,
           margin: 'auto 0'
         }}>
-          {/* Pot display as in reference */}
           <div style={{ textAlign: 'center' }}>
             <div style={{
               display: 'flex',
@@ -905,8 +1052,7 @@ export default function App() {
                     boxShadow: '0 8px 18px rgba(0,0,0,0.5)',
                     color: isRed ? '#dc2626' : '#111827',
                     fontWeight: '800',
-                    transform: 'translateY(-2px)',
-                    transition: 'transform 0.2s ease'
+                    transform: 'translateY(-2px)'
                   }}
                 >
                   <div style={{ fontSize: '15px', lineHeight: 1 }}>{card.rank}</div>
@@ -918,7 +1064,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* BOTTOM: Current Player's Two Large Angled Cards & My Info */}
+        {/* BOTTOM: Current Player's Cards & Info */}
         {me && (
           <div style={{
             position: 'relative',
@@ -960,7 +1106,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Two Cards angled exactly like in the reference image */}
+            {/* Two Cards angled exactly like in reference */}
             <div style={{
               position: 'relative',
               width: '150px',
@@ -1023,7 +1169,7 @@ export default function App() {
               )}
             </div>
 
-            {/* My Info Bar (Chips & Status) */}
+            {/* My Info Bar */}
             <div style={{
               display: 'flex',
               alignItems: 'center',
@@ -1061,7 +1207,7 @@ export default function App() {
         )}
       </div>
 
-      {/* FOOTER ACTION BAR (Mobile Optimized Controls like in reference) */}
+      {/* FOOTER ACTION BAR */}
       <div style={{
         background: '#090a10',
         borderTop: '1px solid rgba(255,255,255,0.08)',
@@ -1135,7 +1281,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 3 Main Action Buttons + Turn Indicator */}
+            {/* 3 Main Action Buttons */}
             <div style={{ display: 'flex', gap: '8px' }}>
               {/* FOLD */}
               <button
